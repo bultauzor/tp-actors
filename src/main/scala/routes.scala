@@ -1,19 +1,21 @@
 package fr.cytech.icc
 
-import java.time.OffsetDateTime
-import java.util.UUID
-import scala.concurrent.{ ExecutionContext, Future }
+import RoomListMessage.{CreateRoom, GetRoom, ListRooms}
 
-import Message.LatestPost
-import RoomListMessage.GetRoom
-import org.apache.pekko.actor.typed.{ ActorRef, Scheduler }
 import org.apache.pekko.actor.typed.scaladsl.AskPattern.*
+import org.apache.pekko.actor.typed.{ActorRef, Scheduler}
+import org.apache.pekko.dispatch.sysmsg.Create
 import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import org.apache.pekko.http.scaladsl.marshalling.ToResponseMarshallable
 import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.{ Directives, Route }
+import org.apache.pekko.http.scaladsl.server.{Directives, Route}
 import org.apache.pekko.util.Timeout
 import spray.json.*
+
+import java.time.OffsetDateTime
+import java.util.UUID
+import scala.collection.SortedSet
+import scala.concurrent.{ExecutionContext, Future}
 
 case class PostInput(author: String, content: String)
 
@@ -34,6 +36,10 @@ object PostOutput {
     )
   }
 }
+
+given Ordering[PostOutput] = Ordering.by(_.postedAt)
+
+case class RoomOutput(name: String, posts: SortedSet[PostOutput])
 
 case class Controller(
     rooms: ActorRef[RoomListMessage]
@@ -69,6 +75,17 @@ case class Controller(
     }
   }
 
+  given JsonFormat[SortedSet[PostOutput]] = new JsonFormat[SortedSet[PostOutput]] {
+    def write(posts: SortedSet[PostOutput]): JsValue = JsArray(posts.toVector.map(_.toJson))
+
+    def read(value: JsValue): SortedSet[PostOutput] = {
+      value match {
+        case JsArray(posts) => SortedSet.from(posts.map(_.convertTo[PostOutput]))
+        case _              => throw DeserializationException("Not an array")
+      }
+    }
+  }
+
   given RootJsonFormat[PostInput] = {
     jsonFormat2(PostInput.apply)
   }
@@ -81,24 +98,28 @@ case class Controller(
     jsonFormat5(PostOutput.apply)
   }
 
+  given RootJsonFormat[RoomOutput] = {
+    jsonFormat2(RoomOutput.apply)
+  }
+
   val routes: Route = concat(
     path("rooms") {
       post {
         entity(as[RoomInput]) { payload => createRoom(payload) }
       } ~ get {
-        listRooms()
+        complete(listRooms())
       }
     },
     path("rooms" / Segment) { roomId =>
       get {
-        getRoom(roomId)
+        complete(getRoom(roomId))
       }
     },
     path("rooms" / Segment / "posts") { roomId =>
       post {
-        entity(as[PostInput]) { payload => createPost(roomId, payload) }
+        entity(as[PostInput]) { payload => complete(createPost(roomId, payload)) }
       } ~ get {
-        listPosts(roomId)
+        complete(listPosts(roomId))
       }
     },
     path("rooms" / Segment / "posts" / "latest") { roomId =>
@@ -108,20 +129,60 @@ case class Controller(
     },
     path("rooms" / Segment / "posts" / Segment) { (roomId, messageId) =>
       get {
-        getPost(roomId, messageId)
+        complete(getPost(roomId, messageId))
       }
     }
   )
 
-  private def createRoom(input: RoomInput) = ???
+  private def createRoom(input: RoomInput) = {
+    rooms ! CreateRoom(input.name)
+    complete(StatusCodes.Created)
+  }
 
-  private def listRooms() = ???
+  private def listRooms(): Future[ToResponseMarshallable] =
+    rooms.ask[Iterable[String]](ref => ListRooms(ref)).flatMap { rooms => Future.sequence(rooms.map(_getRoom)) }.map {
+      rooms => rooms.map(_.get)
+    }
 
-  private def getRoom(roomId: String) = ???
+  private def getRoom(roomId: String): Future[ToResponseMarshallable] = _getRoom(roomId).map {
+    case Some(room) => StatusCodes.OK -> room
+    case None       => StatusCodes.NotFound
+  }
 
-  private def createPost(roomId: String, input: PostInput) = ???
+  private def _getRoom(roomId: String): Future[Option[RoomOutput]] =
+    rooms.ask[Option[ActorRef[Message]]](ref => GetRoom(roomId, ref)).flatMap {
+      case Some(roomActorRef) =>
+        roomActorRef.ask[SortedSet[Post]](ref => Message.ListPosts(ref)).map { posts =>
+          Some(RoomOutput(roomId, posts.map(_.output(roomId))))
+        }
+      case None => Future.successful(None)
+    }
 
-  private def listPosts(roomId: String) = ???
+  private def createPost(roomId: String, input: PostInput): Future[ToResponseMarshallable] =
+    rooms
+      .ask[Option[ActorRef[Message]]](ref => GetRoom(roomId, ref))
+      .flatMap {
+        case Some(roomActorRef) =>
+          Future.successful(Some(roomActorRef ! Message.CreatePost(input.author, input.content)))
+        case None => Future.successful(None)
+      }
+      .map {
+        case Some(_) =>
+          StatusCodes.Created
+        case None =>
+          StatusCodes.NotFound
+      }
+
+  private def listPosts(roomId: String): Future[ToResponseMarshallable] = rooms
+    .ask[Option[ActorRef[Message]]](ref => GetRoom(roomId, ref))
+    .flatMap {
+      case Some(roomActorRef) => roomActorRef.ask[SortedSet[Post]](ref => Message.ListPosts(ref)).map(Some(_))
+      case None               => Future.successful(None)
+    }
+    .map {
+      case Some(posts) => StatusCodes.OK -> posts.map(_.output(roomId)).toJson
+      case None        => StatusCodes.NotFound
+    }
 
   private def getLatestPost(roomId: String): Future[ToResponseMarshallable] =
     rooms
@@ -137,5 +198,18 @@ case class Controller(
           StatusCodes.NotFound
       }
 
-  private def getPost(roomId: String, messageId: String) = ???
+  private def getPost(roomId: String, messageId: String): Future[ToResponseMarshallable] =
+    rooms
+      .ask[Option[ActorRef[Message]]](ref => GetRoom(roomId, ref))
+      .flatMap {
+        case Some(roomActorRef) =>
+          roomActorRef.ask[Option[Post]](ref => Message.GetPost(UUID.fromString(messageId), ref))
+        case None => Future.successful(None)
+      }
+      .map {
+        case Some(post) =>
+          StatusCodes.OK -> post.output(roomId)
+        case None =>
+          StatusCodes.NotFound
+      }
 }
